@@ -7,30 +7,35 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class SharedCacheUpdater<Result : Any>(
     private val updateScope: CoroutineScope,
     private val updater: suspend () -> Result,
 ) {
 
-    private val sharedMutex = Mutex()
+    // TODO: replace by kotlinx.atomicfu.locks.ReentrantLock
+    private val reentrantLock = ReentrantLock()
 
     private val shared = MutableSharedFlow<Result>(
         replay = 0,
         extraBufferCapacity = 0,
         onBufferOverflow = BufferOverflow.SUSPEND,
     ).apply {
+        var prevSubscriberCount = 0
         updateScope.launch {
             subscriptionCount
-                .collectLatest {
-                    println("subscribers $it")
-                    if (it > 0) {
-                        ensureActiveUpdate()
+                .collectLatest {currentSubscribersCount ->
+                    if (currentSubscribersCount > 0) {
+                        // start job only if count of somebody subscribe
+                        if (currentSubscribersCount > prevSubscriberCount) {
+                            ensureActiveUpdate()
+                        }
                     } else {
                         updaterJob = null
                     }
+                    prevSubscriberCount = currentSubscribersCount
                 }
         }
     }
@@ -44,9 +49,9 @@ class SharedCacheUpdater<Result : Any>(
 
     suspend fun getShared(): Result = shared.first()
 
-    private suspend fun ensureActiveUpdate() {
+    private fun ensureActiveUpdate() {
         println("ensureActiveUpdate")
-        sharedMutex.withLock {
+        reentrantLock.withLock {
             if (updaterJob == null || updaterJob?.isActive == false) {
                 startUpdate()
             }
@@ -57,8 +62,10 @@ class SharedCacheUpdater<Result : Any>(
         println("startUpdate")
         updaterJob = updateScope.launch {
             val newValue = updater.invoke()
-            sharedMutex.withLock {
-                shared.emit(newValue)
+            reentrantLock.withLock {
+                updateScope.launch {
+                    shared.emit(newValue)
+                }
                 updaterJob = null
             }
         }
